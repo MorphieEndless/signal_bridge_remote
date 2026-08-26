@@ -17,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-from typing import Optional
+import math
+from typing import Any, Optional
 
 from .models import (
     OutputType, InputType,
@@ -66,6 +67,113 @@ def _register_tool(name: str, description: str, params: dict, required: list[str
 # ════════════════════════════════════════════════════════════════════════
 # Helper
 # ════════════════════════════════════════════════════════════════════════
+
+
+def _coerce_number(value: Any, field: str) -> float:
+    """Accept JSON numbers and common LLM numeric-string variants safely."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be numeric, not boolean")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{field} must not be empty")
+        is_percent = text.endswith("%")
+        if is_percent:
+            text = text[:-1].strip()
+        try:
+            number = float(text)
+        except ValueError as exc:
+            raise ValueError(f"{field} is not numeric: {value!r}") from exc
+        if is_percent:
+            number /= 100.0
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a number or numeric string") from exc
+
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    return number
+
+
+def _numeric_schema(description: str, default: float) -> dict:
+    return {
+        "type": "number",
+        "description": description,
+        "default": default,
+    }
+
+
+def _constrict_mode(value: Any) -> int:
+    """Validate SX589B suction mode (protocol byte4)."""
+    number = _coerce_number(value, "mode")
+    if not number.is_integer() or not 1 <= number <= 8:
+        raise ValueError("mode must be an integer from 1 to 8")
+    return int(number)
+
+
+_CONSTRICT_MODE_PARAM = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 8,
+    "default": 5,
+    "description": (
+        "Suction protocol mode (byte4): 1=pulse, 2/3=flutter, "
+        "4=alternate pulse, 5=continuous, 6/7=rhythm, 8≈pulse."
+    ),
+}
+
+
+# Built-in fallback for clients that have not yet reported machine-readable
+# output step counts. Device reports override this table when available.
+_BUILTIN_OUTPUT_STEPS: dict[str, dict[str, int]] = {
+    "yingti": {"vibrate": 10, "constrict": 5},
+}
+
+
+def _snap_to_steps(intensity: float, steps: int) -> float:
+    """Snap a normalized intensity to a real hardware level (half rounds up)."""
+    value = max(0.0, min(1.0, intensity))
+    if value <= 0.0 or steps <= 0:
+        return 0.0 if value <= 0.0 else value
+    level = math.floor(value * steps + 0.5)
+    level = max(1, min(steps, level))
+    return level / steps
+
+
+async def _quantize_for_device(device: str, output_type: str, intensity: float) -> float:
+    """Use the connected device's discrete output levels when it has any."""
+    user_id = current_user_id.get()
+    devices = await registry.get_devices(user_id)
+
+    if device == "all":
+        targets = devices
+    else:
+        targets = [d for d in devices if d.get("short_name") == device]
+
+    # A single command can only carry one intensity. Quantize when every target
+    # that advertises steps agrees; otherwise leave continuous values untouched.
+    counts: set[int] = set()
+    for target in targets:
+        short_name = str(target.get("short_name", ""))
+        reported = target.get("output_steps", {})
+        steps = reported.get(output_type) if isinstance(reported, dict) else None
+        if not isinstance(steps, int) or steps <= 0:
+            steps = _BUILTIN_OUTPUT_STEPS.get(short_name, {}).get(output_type)
+        if isinstance(steps, int) and steps > 0:
+            counts.add(steps)
+
+    # Explicit Yingti commands still quantize during the brief reconnect window
+    # before device_list has arrived.
+    if not counts and device != "all":
+        fallback = _BUILTIN_OUTPUT_STEPS.get(device, {}).get(output_type)
+        if fallback:
+            counts.add(fallback)
+
+    return _snap_to_steps(intensity, counts.pop()) if len(counts) == 1 else intensity
+
 
 async def _send(
     command: dict, intensity: float = 0.0, duration: float = 0.0
@@ -152,8 +260,18 @@ async def list_devices(**kwargs) -> str:
         caps = ", ".join(caps_parts)
         notes = d.get("notes", "")
         floor = d.get("intensity_floor", 0)
+        output_steps = d.get("output_steps", {})
+        steps_text = ", ".join(f"{key}={value}" for key, value in output_steps.items()) \
+            if isinstance(output_steps, dict) else ""
+        options = d.get("output_options", {})
+        mode_text = ""
+        if isinstance(options, dict) and isinstance(options.get("constrict_mode"), dict):
+            mode = options["constrict_mode"]
+            mode_text = f"constrict mode={mode.get('min', 1)}-{mode.get('max', 8)} (default {mode.get('default', 5)})"
         lines.append(
             f"• {d.get('short_name', '?')} — capabilities: [{caps}]"
+            + (f" | steps: {steps_text}" if steps_text else "")
+            + (f" | {mode_text}" if mode_text else "")
             + (f" | floor: {floor}" if floor > 0 else "")
             + (f" | {notes}" if notes else "")
         )
@@ -194,16 +312,13 @@ _OUTPUT_PARAMS = {
         "description": "Device short name or 'all'",
         "default": "all",
     },
-    "intensity": {
-        "type": "number",
-        "description": "Intensity from 0.0 (off) to 1.0 (maximum)",
-        "default": 0.5,
-    },
-    "duration": {
-        "type": "number",
-        "description": "Duration in seconds. 0 = stay on until stop command.",
-        "default": 0,
-    },
+    "intensity": _numeric_schema(
+        "Requested intensity from 0.0 to 1.0. Discrete devices snap it to the nearest real hardware level (yingti vibration: 0.1 steps; suction: 1/5 steps)",
+        0.5,
+    ),
+    "duration": _numeric_schema(
+        "Duration in seconds. 0 = stay on until stop command", 0
+    ),
     "feature_index": {
         "type": "integer",
         "description": (
@@ -219,16 +334,19 @@ def _make_output_handler(output_type: OutputType):
     """Factory for output command handlers."""
     async def handler(
         device: str = "all", intensity: float = 0.5, duration: float = 0,
-        feature_index: Optional[int] = None, **kw
+        feature_index: Optional[int] = None, mode: Any = 5, **kw
     ) -> str:
-        clamped = max(0.0, min(1.0, float(intensity)))
-        dur = max(0.0, float(duration))
+        requested = max(0.0, min(1.0, _coerce_number(intensity, "intensity")))
+        clamped = await _quantize_for_device(device, output_type.value, requested)
+        dur = max(0.0, _coerce_number(duration, "duration"))
+        suction_mode = _constrict_mode(mode) if output_type == OutputType.CONSTRICT else None
         cmd = DeviceCommand(
             action=output_type,
             device=device,
             intensity=clamped,
             duration=dur,
             feature_index=feature_index,
+            mode=suction_mode,
         )
         return await _send(cmd.model_dump(), intensity=clamped, duration=dur)
     return handler
@@ -263,8 +381,8 @@ _register_tool(
 # Extended outputs (device-specific, may not be available on all hardware)
 _register_tool(
     "constrict",
-    "Send constriction/compression output. Device-specific.",
-    _OUTPUT_PARAMS,
+    "Control suction/constriction output. On Yingti SX589B, mode selects the protocol rhythm and intensity selects one of five real strength levels.",
+    _OUTPUT_PARAMS | {"mode": _CONSTRICT_MODE_PARAM},
     required=["device"],
 )(_make_output_handler(OutputType.CONSTRICT))
 
@@ -335,22 +453,21 @@ _PATTERN_PARAMS = {
                        "constrict, temperature, led, position, spray",
         "default": "vibrate",
     },
-    "intensity": {
-        "type": "number",
-        "description": "Set intensity (0.0–1.0)",
-        "default": 0.5,
-    },
-    "duration": {
-        "type": "number",
-        "description": "Duration in seconds",
-        "default": 60,
-    },
+    "intensity": _numeric_schema(
+        "Requested peak intensity (0.0–1.0); snapped to the nearest real hardware level on discrete devices",
+        0.5,
+    ),
+    "duration": _numeric_schema("Duration in seconds", 60),
     "feature_index": {
         "type": "integer",
         "description": (
             "Target a specific actuator by index when a device has multiple "
             "actuators of the same type. Omit to drive all matching actuators."
         ),
+    },
+    "mode": {
+        **_CONSTRICT_MODE_PARAM,
+        "description": _CONSTRICT_MODE_PARAM["description"] + " Used only when output_type=constrict.",
     },
 }
 
@@ -363,19 +480,24 @@ def _make_pattern_handler(pattern_name: str):
         duration: float = 10,
         hold_seconds: float = 0,
         feature_index: Optional[int] = None,
+        mode: Any = 5,
         **kw,
     ) -> str:
-        clamped = max(0.0, min(1.0, float(intensity)))
-        dur = max(0.0, float(duration))
-        hold = max(0.0, float(hold_seconds))
+        requested = max(0.0, min(1.0, _coerce_number(intensity, "intensity")))
+        clamped = await _quantize_for_device(device, output_type, requested)
+        dur = max(0.0, _coerce_number(duration, "duration"))
+        hold = max(0.0, _coerce_number(hold_seconds, "hold_seconds"))
+        output = OutputType(output_type)
+        suction_mode = _constrict_mode(mode) if output == OutputType.CONSTRICT else None
         cmd = PatternCommand(
             pattern=pattern_name,
-            output_type=OutputType(output_type),
+            output_type=output,
             device=device,
             intensity=clamped,
             duration=dur,
             hold_seconds=hold,
             feature_index=feature_index,
+            mode=suction_mode,
         )
         # How long before the phone stops this by itself. escalate ramps over
         # `duration` and then holds — indefinitely unless hold_seconds is set,
@@ -414,12 +536,11 @@ _register_tool(
     "Works with any output type (default: vibrate).",
     {k: v for k, v in _PATTERN_PARAMS.items() if k != "intensity"}
     | {
-        "intensity": {"type": "number", "description": "Peak intensity to ramp up to", "default": 1.0},
-        "hold_seconds": {
-            "type": "number",
-            "description": "Seconds to hold at peak after ramp completes. 0 = hold indefinitely until explicit stop.",
-            "default": 0,
-        },
+        "intensity": _numeric_schema("Peak intensity to ramp up to", 1.0),
+        "hold_seconds": _numeric_schema(
+            "Seconds to hold at peak after ramp completes. 0 = hold indefinitely until explicit stop",
+            0,
+        ),
     },
     required=["device"],
 )(_make_pattern_handler("escalate"))
@@ -437,29 +558,25 @@ _register_tool(
             "type": "string",
             "description": "Device short name",
         },
+
+
     },
+    required=["device"],
 )
-async def read_battery(device: str, **kwargs) -> str:
-    cmd = ReadSensorCommand(sensor=InputType.BATTERY, device=device)
-    return await _send(cmd.model_dump())
+async def read_battery(device: str = "all", **kwargs) -> str:
+    return await _send(ReadSensorCommand(sensor=InputType.BATTERY, device=device).model_dump())
 
 
 @_register_tool(
-    "read_sensor",
-    "Read a sensor value from a device. Available sensors depend on hardware: "
-    "battery, rssi (signal strength), pressure, button, depth, position. "
-    "Not all devices support all sensors.",
+    "read_rssi",
+    "Read signal strength of a connected device. Returns dBm value (0 to -100).",
     {
         "device": {
             "type": "string",
             "description": "Device short name",
         },
-        "sensor": {
-            "type": "string",
-            "description": "Sensor type: battery, rssi, pressure, button, depth, position",
-        },
     },
+    required=["device"],
 )
-async def read_sensor(device: str, sensor: str, **kwargs) -> str:
-    cmd = ReadSensorCommand(sensor=InputType(sensor), device=device)
-    return await _send(cmd.model_dump())
+async def read_rssi(device: str = "all", **kwargs) -> str:
+    return await _send(ReadSensorCommand(sensor=InputType.RSSI, device=device).model_dump())
