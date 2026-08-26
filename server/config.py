@@ -20,6 +20,9 @@ CORS_ORIGINS = os.getenv("SB_CORS_ORIGINS", "*").split(",")
 TOKEN_EXPIRY_HOURS = int(os.getenv("SB_TOKEN_EXPIRY_HOURS", "168"))  # 1 week
 REGISTRATION_OPEN = os.getenv("SB_REGISTRATION_OPEN", "true").lower() == "true"
 REQUIRE_MCP_AUTH = os.getenv("SB_REQUIRE_MCP_AUTH", "false").lower() == "true"
+# Optional single-user self-hosting mode. The same token authenticates the
+# Android phone WebSocket and MCP HTTP requests. Leave blank to disable.
+STATIC_BEARER_TOKEN = os.getenv("SB_STATIC_BEARER_TOKEN", "").strip()
 
 # ── Rate Limiting ───────────────────────────────────────────────────────
 # Format: "count/period" — e.g. "5/minute", "100/hour"
@@ -54,4 +57,9 @@ def validate():
         raise RuntimeError(
             "SB_SECRET_KEY is not set. Generate one with: "
             "python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+    if STATIC_BEARER_TOKEN and len(STATIC_BEARER_TOKEN) < 32:
+        raise RuntimeError(
+            "SB_STATIC_BEARER_TOKEN must be at least 32 characters. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
         )

@@ -6,6 +6,7 @@ progressive IP banning, and per-endpoint rate limiting.
 """
 from __future__ import annotations
 import asyncio
+import hmac
 import sqlite3
 import time
 import uuid
@@ -186,7 +187,9 @@ def create_token(user_id: str, username: str) -> str:
 
 
 def verify_token(token: str) -> Optional[dict]:
-    """Validate a JWT. Returns payload dict or None."""
+    """Validate the optional static Bearer token or a JWT."""
+    if config.STATIC_BEARER_TOKEN and hmac.compare_digest(token, config.STATIC_BEARER_TOKEN):
+        return {"user_id": "static-bearer-user", "username": "static-token"}
     try:
         payload = jwt.decode(token, config.SECRET_KEY, algorithms=["HS256"])
         return {"user_id": payload["sub"], "username": payload["username"]}

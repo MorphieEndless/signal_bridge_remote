@@ -1,0 +1,24 @@
+name: Test server
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install -r requirements-server.txt httpx
+      - name: Compile Python sources
+        run: python -m compileall -q server tests
+      - name: Server verification
+        run: python tests/verify_server.py
+      - name: Static Bearer verification
+        run: python tests/verify_static_token.py
