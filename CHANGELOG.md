@@ -29,6 +29,19 @@
 
 ### Added
 
+- **Server-side pattern library (waveform CRUD).** Five new MCP tools:
+  `create_pattern`, `list_patterns`, `get_pattern`, `delete_pattern`,
+  `play_pattern`. Save a favourite custom waveform once and replay it by
+  name, optionally at a different strength. Patterns are stored per-user
+  as JSON under `SB_PATTERNS_DIR` (default `server/data/patterns`),
+  validated server-side with the same limits the phone enforces
+  (1-128 steps, step ≥ 100ms, repeat ≤ 20, total ≤ 10 minutes) and
+  re-validated on the phone at execution time. `play_pattern` expands the
+  saved steps into a `custom_pattern` command and routes through the same
+  governor heat tracking as any other command.
+- `tests/verify_patterns.py` — offline verification of the pattern store
+  and the five new MCP tools (CRUD, boundary validation, scale override,
+  governor integration). `python tests/verify_patterns.py`
 - `tests/verify_governor.py` — offline verification of the heat model:
   the disabled path, timed-command expiry, and the enabled-path invariants
   (cooldown trigger, cooldown exit on both heat and time, idle dissipation).
