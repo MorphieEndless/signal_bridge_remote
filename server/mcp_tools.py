@@ -1,3 +1,19 @@
+"""
+Signal Bridge Remote — MCP Tool Definitions
+
+All tools that Claude can call to control devices. Each tool:
+  1. Validates input
+  2. Builds a command message
+  3. Routes it through the session registry to the user's phone
+  4. Returns the result to Claude
+
+Expanded to support ALL output types:
+  vibrate, rotate, oscillate, constrict, temperature, led, position, spray
+
+And sensor input types:
+  battery, rssi, pressure, button, depth, position
+"""
+from __future__ import annotations
 import asyncio
 import contextvars
 import json
