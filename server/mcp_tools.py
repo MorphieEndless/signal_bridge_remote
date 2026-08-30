@@ -1,19 +1,3 @@
-"""
-Signal Bridge Remote — MCP Tool Definitions
-
-All tools that Claude can call to control devices. Each tool:
-  1. Validates input
-  2. Builds a command message
-  3. Routes it through the session registry to the user's phone
-  4. Returns the result to Claude
-
-Expanded to support ALL output types:
-  vibrate, rotate, oscillate, constrict, temperature, led, position, spray
-
-And sensor input types:
-  battery, rssi, pressure, button, depth, position
-"""
-from __future__ import annotations
 import asyncio
 import contextvars
 import json
@@ -26,6 +10,7 @@ from .models import (
     CommandAck,
 )
 from .governor import governor
+from .pattern_store import pattern_store
 from .session_registry import registry
 
 # Set by auth middleware before each MCP request
@@ -558,25 +543,240 @@ _register_tool(
             "type": "string",
             "description": "Device short name",
         },
-
-
     },
-    required=["device"],
 )
-async def read_battery(device: str = "all", **kwargs) -> str:
-    return await _send(ReadSensorCommand(sensor=InputType.BATTERY, device=device).model_dump())
+async def read_battery(device: str, **kwargs) -> str:
+    cmd = ReadSensorCommand(sensor=InputType.BATTERY, device=device)
+    return await _send(cmd.model_dump())
 
 
 @_register_tool(
-    "read_rssi",
-    "Read signal strength of a connected device. Returns dBm value (0 to -100).",
+    "read_sensor",
+    "Read a sensor value from a device. Available sensors depend on hardware: "
+    "battery, rssi (signal strength), pressure, button, depth, position. "
+    "Not all devices support all sensors.",
     {
         "device": {
             "type": "string",
             "description": "Device short name",
         },
+        "sensor": {
+            "type": "string",
+            "description": "Sensor type: battery, rssi, pressure, button, depth, position",
+        },
     },
-    required=["device"],
 )
-async def read_rssi(device: str = "all", **kwargs) -> str:
-    return await _send(ReadSensorCommand(sensor=InputType.RSSI, device=device).model_dump())
+async def read_sensor(device: str, sensor: str, **kwargs) -> str:
+    cmd = ReadSensorCommand(sensor=InputType(sensor), device=device)
+    return await _send(cmd.model_dump())
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Pattern Library — persistent named waveforms (CRUD + play)
+# ════════════════════════════════════════════════════════════════════════
+
+_PATTERN_STEP_ITEM = {
+    "type": "object",
+    "description": (
+        "One step: {duration_ms (int, >=100), vibrate (0-1), constrict (0-1), "
+        "constrict_mode (int 1-8, optional, suction only)}. vibrate/constrict "
+        "default to 0 when omitted."
+    ),
+}
+
+_PATTERN_STEPS_PARAM = {
+    "type": "array",
+    "description": (
+        "Ordered list of 1-128 steps. Each step runs for duration_ms on the "
+        "device, then the next begins. vibrate and constrict are independent "
+        "channels and may both be active in the same step. Total runtime "
+        "(sum of duration_ms × repeat) must be ≤ 10 minutes."
+    ),
+    "items": _PATTERN_STEP_ITEM,
+}
+
+
+@_register_tool(
+    "create_pattern",
+    "Save a named custom waveform to the server-side pattern library. "
+    "You can replay it later by name with play_pattern. Steps are ordered; "
+    "each step may drive vibrate and/or constrict simultaneously.",
+    {
+        "name": {"type": "string", "description": "Unique name for the pattern (≤64 chars)"},
+        "steps": _PATTERN_STEPS_PARAM,
+        "repeat": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 1,
+            "description": "How many times the step sequence repeats",
+        },
+        "intensity_scale": _numeric_schema(
+            "Global multiplier (0-1) applied to every step's intensities on playback. "
+            "Lets one saved pattern be played at different strengths.",
+            1.0,
+        ),
+        "description": {
+            "type": "string",
+            "description": "Optional human-readable note about the pattern",
+            "default": "",
+        },
+        "device": {
+            "type": "string",
+            "description": "Device short name",
+            "default": "yingti",
+        },
+    },
+    required=["name", "steps"],
+)
+async def create_pattern(
+    name: str, steps: list, repeat: int = 1, intensity_scale: float = 1.0,
+    description: str = "", device: str = "yingti", **kwargs,
+) -> str:
+    user_id = current_user_id.get()
+    try:
+        pattern = pattern_store.create(
+            user_id=user_id,
+            name=name,
+            steps=steps,
+            repeat=repeat,
+            intensity_scale=intensity_scale,
+            description=description,
+            device=device,
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return (
+        f"Pattern '{pattern.name}' saved (id={pattern.id}, "
+        f"{len(pattern.steps)} steps × {pattern.repeat}, "
+        f"total {pattern.total_ms() / 1000:.1f}s, "
+        f"peak {pattern.peak_intensity():.0%}). "
+        f"Run it with play_pattern(name_or_id='{pattern.name}')."
+    )
+
+
+@_register_tool(
+    "list_patterns",
+    "List all saved waveforms in the server-side pattern library.",
+    {},
+)
+async def list_patterns(**kwargs) -> str:
+    user_id = current_user_id.get()
+    patterns = pattern_store.list(user_id)
+    if not patterns:
+        return (
+            "No saved patterns yet. Create one with create_pattern "
+            "(e.g. a favourite buildup or a named suction rhythm)."
+        )
+    lines = []
+    for pattern in patterns:
+        total_s = (
+            sum(step["duration_ms"] for step in pattern["steps"])
+            * pattern["repeat"] / 1000.0
+        )
+        line = (
+            f"• {pattern['name']} (id={pattern['id']}) — "
+            f"{len(pattern['steps'])} steps × {pattern['repeat']}, "
+            f"~{total_s:.0f}s"
+        )
+        if pattern.get("description"):
+            line += f" — {pattern['description']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@_register_tool(
+    "get_pattern",
+    "Get the full step definition of a saved waveform by name or id. "
+    "Returns JSON with steps, repeat, and intensity_scale.",
+    {
+        "name_or_id": {
+            "type": "string",
+            "description": "Pattern name (case-insensitive) or id",
+        },
+    },
+    required=["name_or_id"],
+)
+async def get_pattern(name_or_id: str, **kwargs) -> str:
+    user_id = current_user_id.get()
+    pattern = pattern_store.get(user_id, name_or_id)
+    if not pattern:
+        return f"Error: no pattern named '{name_or_id}'. Use list_patterns to see saved patterns."
+    return json.dumps(pattern.model_dump(), ensure_ascii=False, indent=2)
+
+
+@_register_tool(
+    "delete_pattern",
+    "Delete a saved waveform from the server-side pattern library by name or id.",
+    {
+        "name_or_id": {
+            "type": "string",
+            "description": "Pattern name (case-insensitive) or id",
+        },
+    },
+    required=["name_or_id"],
+)
+async def delete_pattern(name_or_id: str, **kwargs) -> str:
+    user_id = current_user_id.get()
+    if pattern_store.delete(user_id, name_or_id):
+        return f"Pattern '{name_or_id}' deleted."
+    return f"Error: no pattern named '{name_or_id}'. Use list_patterns to see saved patterns."
+
+
+@_register_tool(
+    "play_pattern",
+    "Replay a saved waveform from the server-side pattern library on the connected device. "
+    "Optionally override its saved intensity_scale to play softer or stronger this time.",
+    {
+        "name_or_id": {
+            "type": "string",
+            "description": "Pattern name (case-insensitive) or id",
+        },
+        "device": {
+            "type": "string",
+            "description": "Device short name",
+            "default": "yingti",
+        },
+        "intensity_scale": _numeric_schema(
+            "Optional override of the saved intensity multiplier (0-1). "
+            "Omit to use the pattern's saved value.",
+            None,
+        ),
+    },
+    required=["name_or_id"],
+)
+async def play_pattern(
+    name_or_id: str, device: str = "yingti", intensity_scale: float = None, **kwargs,
+) -> str:
+    user_id = current_user_id.get()
+    pattern = pattern_store.get(user_id, name_or_id)
+    if not pattern:
+        return f"Error: no pattern named '{name_or_id}'. Use list_patterns to see saved patterns."
+
+    # Effective scale: caller override wins, else the saved one.
+    if intensity_scale is None:
+        scale = pattern.intensity_scale
+    else:
+        scale = max(0.0, min(1.0, _coerce_number(intensity_scale, "intensity_scale")))
+
+    steps = []
+    for step in pattern.steps:
+        item = {
+            "duration_ms": step.duration_ms,
+            "vibrate": round(step.vibrate * scale, 4),
+            "constrict": round(step.constrict * scale, 4),
+        }
+        if step.constrict_mode is not None:
+            item["constrict_mode"] = step.constrict_mode
+        steps.append(item)
+
+    command = {
+        "type": "custom_pattern",
+        "device": device,
+        "name": pattern.name,
+        "steps": steps,
+        "repeat": pattern.repeat,
+    }
+    peak = max([0.0] + [s["vibrate"] for s in steps] + [s["constrict"] for s in steps])
+    duration_s = sum(s["duration_ms"] for s in steps) * pattern.repeat / 1000.0
+    return await _send(command, intensity=peak, duration=duration_s)
