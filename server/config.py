@@ -47,6 +47,10 @@ GOVERNOR_COOLDOWN_THRESHOLD = float(os.getenv("SB_GOVERNOR_COOLDOWN_ENTER", "90.
 GOVERNOR_COOLDOWN_EXIT = float(os.getenv("SB_GOVERNOR_COOLDOWN_EXIT", "30.0"))        # heat% to exit cooldown
 GOVERNOR_COOLDOWN_DURATION = float(os.getenv("SB_GOVERNOR_COOLDOWN_DURATION", "30.0"))  # min seconds in cooldown
 
+# ── Pattern Library ─────────────────────────────────────────────────────
+# Per-user JSON storage for saved custom waveforms (pattern_store.py).
+PATTERNS_DIR = os.getenv("SB_PATTERNS_DIR", str(Path(__file__).parent / "data" / "patterns"))
+
 # ── Database ────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("SB_DB_PATH", str(Path(__file__).parent / "signal_bridge.db"))
 
