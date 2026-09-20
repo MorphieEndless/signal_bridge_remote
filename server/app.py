@@ -17,7 +17,7 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -64,6 +64,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Signal Bridge Remote",
     version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     lifespan=lifespan,
 )
 
@@ -284,7 +287,7 @@ async def mcp_endpoint(request: Request):
             return _jsonrpc_result(req_id, {
                 "content": [{"type": "text", "text": result_text}],
             })
-        except Exception as e:
+        except Exception as e:\
             log.error(f"Tool {tool_name} error: {e}")
             return _jsonrpc_result(req_id, {
                 "content": [{"type": "text", "text": f"Error: {e}"}],
@@ -581,15 +584,4 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {
-        "service": "Signal Bridge Remote",
-        "version": "1.0.0",
-        "endpoints": {
-            "auth": "/auth/register, /auth/login",
-            "oauth": "/.well-known/oauth-authorization-server, /oauth/register, /oauth/authorize, /oauth/token",
-            "mcp": "/mcp (POST, JSON-RPC)",
-            "phone_relay": "/ws/phone (WebSocket)",
-            "safety": "/safety/config (GET, POST), /safety/status (GET)",
-            "health": "/health",
-        },
-    }
+    raise HTTPException(status_code=404, detail="Not Found")
