@@ -69,7 +69,7 @@ Sign up at [DigitalOcean](https://www.digitalocean.com/) and create a droplet:
 - **Region**: Choose one close to you for lower latency
 - **Authentication**: SSH key (recommended) or password
 
-Note your droplet's IP address (e.g., `192.0.2.14`).
+Note your droplet's IP address.
 
 ### 1.2 Install Docker
 
